@@ -20,7 +20,7 @@ from template_fit_multicanale import (
 # =====================================================================
 N_TOYS: int = 10_000
 RANDOM_SEED: int = 12345
-TOY_MODE: str = "poisson_effective"  # "poisson_effective" oppure "gaussian"
+TOY_MODE: str = "poisson_effective"  
 
 OUTPUT_DIR: str = "output_template_fit_validation"
 
@@ -44,7 +44,7 @@ def run_mle_cross_check(
         return float(np.sum((residual / sigma) ** 2))
 
     m = Minuit(chi2, *np.ones(n_signal), name=param_names)
-    m.errordef = Minuit.LEAST_SQUARES  # dice a iminuit che chi2 e' gia' su scala corretta
+    m.errordef = Minuit.LEAST_SQUARES  
     m.migrad()
     m.hesse()
 

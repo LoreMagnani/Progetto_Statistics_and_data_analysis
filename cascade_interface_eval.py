@@ -1,91 +1,3 @@
-"""
-=====================================================================
- Inferenza + valutazione a cascata (SB head -> Multiclass head)
- per il classificatore VBS a 5 segnali + fondo.
-=====================================================================
-
-COSA FA
--------
-1. Carica i due modelli Keras allenati SEPARATAMENTE:
-     - sb_model    -> testa binaria Segnale/Fondo (1 uscita, sigmoid)
-     - multi_model -> testa multiclasse sui 5 canali di segnale
-                      (5 uscite "pure", oppure 6 se il modello include
-                      una classe "Fondo" appresa: vedi
-                      MULTICLASS_HAS_BKG_OUTPUT)
-
-2. Legge uno o più file ROOT con `load_root_to_dataframe` (la funzione
-   che mi hai passato, riportata qui sotto invariata) e costruisce il
-   dataset di valutazione: feature, etichetta vera (kind_events) e
-   peso fisico (da weight_weight, scalato alla luminosità con lo
-   schema di scale_sample_weight_to_luminosity).
-
-3. Applica la cascata SB -> multiclass a tutti gli eventi.
-
-4. Produce le diagnostiche che avevi in run_cascaded_evaluation_v2,
-   riadattate per lavorare su predizioni pure (niente History di
-   training, che qui non esiste), calcolate sull'INTERO dataset come
-   controllo generale di qualità:
-     - confusion matrix 2x2 (SB), 5x5 (multiclass sul vero segnale) e
-       6x6 (cascata)
-     - ROC binaria + ROC multiclasse one-vs-rest
-     - purezza/efficienza al taglio scelto (SB e per canale)
-
-5. Divide poi il dataset classificato in due metà statisticamente
-   indipendenti (stratificate, con `split_dataframe_50_50`, la funzione
-   che mi hai passato):
-     - metà "template": i plot di "smistamento" per segnale vero, cioè
-       i tuoi TEMPLATE (uno per ciascuno dei 5 segnali), che mostrano
-       come quel segnale si distribuisce nei 6 canali predetti
-     - metà "composizione": i plot di composizione per canale predetto
-       (sia assoluta che normalizzata per colonna, cioè la purezza),
-       il target del fit che vuoi riprodurre come somma pesata dei
-       template con i parametri mu
-   Per ciascuna delle due metà salva anche, via
-   `process_and_save_nn_results` (adattata da quella che mi hai
-   passato), la matrice dei conteggi pesati, il template di risposta
-   (normalizzato per riga) e quello di composizione (normalizzato per
-   colonna) come DataFrame/parquet, pronti per il fit.
-
-6. Salva un DataFrame con le predizioni evento per evento (prob. SB,
-   prob. per canale, classe cascata, peso fisico), utile per il fit a
-   template che farai fuori da questo script.
-
-COSA DEVI ANCORA PERSONALIZZARE (cerca "# TODO")
--------------------------------------------------
-- percorsi dei due modelli e dei file ROOT
-- nome del tree
-- elenco ESATTO e nell'ORDINE ESATTO delle feature per ciascuna testa
-  (se SB e multiclass usano feature_set diversi, tienili separati)
-- mapping kind_events -> canale (quello sotto è la mia migliore ipotesi
-  in base a quanto mi avevi già detto, MA VERIFICALO)
-- total_events per ciascun file ROOT (serve per scalare weight_weight
-  alla luminosità, stesso identico ruolo che aveva nel tuo
-  scale_sample_weight_to_luminosity)
-
-NOTA SUL PREPROCESSING (importante)
-------------------------------------
-Se in training hai applicato una qualsiasi trasformazione alle feature
-(log1p, sqrt, uno scaler fit sui dati di training...), qui devi
-riapplicare ESATTAMENTE le stesse trasformazioni con gli STESSI
-parametri (es. lo scaler salvato su disco, non uno rifittato su questi
-dati nuovi). Rifittare uno scaler su questo dataset introdurrebbe un
-disallineamento train/inference silenzioso: la funzione
-`preprocess_features` qui sotto è il punto in cui intervenire.
-
-NOTA SUL CONTROLLO "NIENTE DI STRANO"
----------------------------------------
-Hai già verificato che purezza ed efficienza non cambiano in modo
-significativo tra la frazione usata in training e il resto, quindi qui
-non si esclude nulla a priori: si usa l'intero dataset disponibile, che
-poi viene diviso a metà solo per garantire indipendenza statistica tra
-i template (metà "template") e la composizione da fittare (metà
-"composizione"). Se in futuro volessi comunque un controllo più
-stringente, tieni a mente che il modo più robusto resta escludere
-esplicitamente gli eventi già usati in training (se hai gli indici/ID
-dello split) o confrontare le metriche qui ottenute con quelle del test
-set interno al training sugli stessi processi.
-"""
-
 import os
 import sys
 from dataclasses import dataclass
@@ -108,7 +20,6 @@ import matplotlib.pyplot as plt
 LUMINOSITY: float = 10_800_000.0  # pb^-1
 
 SIGNAL_NAMES: List[str] = ["WW+H", "ZZ+H", "ZZ", "WZ", "WW"]
-SIGNAL_NAMES_6: List[str] = ["ZZ+H", "ZZ"]
 
 # kind_events -> indice canale di segnale (0..4, stesso ordine di SIGNAL_NAMES)
 KIND_TO_SIGNAL_IDX: Dict[int, int] = {
@@ -122,8 +33,7 @@ KIND_TO_SIGNAL_IDX: Dict[int, int] = {
 BKG_KIND_VALUES: Sequence[int] = (1, 2)
 
 # La testa multiclass ha 5 uscite "pure" (schema classico, cascata via
-# sola soglia SB) o 6 uscite con una classe "Fondo" appresa (schema
-# "FamoSei")? Metti True nel secondo caso.
+# sola soglia SB) o 6 uscite con una classe "Fondo" appresa
 MULTICLASS_HAS_BKG_OUTPUT: bool = True
 
 
@@ -131,10 +41,8 @@ TREE_NAME: str = "Events"
 LABEL_BRANCH: str = "kind_events"
 WEIGHT_BRANCH: str = "Weight_weight"
 
-# Feature per la testa SB e per la testa multiclass, NELL'ORDINE ESATTO
-# usato in training. Se le due teste condividono lo stesso feature_set
-# puoi semplicemente usare la stessa lista per entrambe.
-RAW_FEATURE_BRANCHES_4l: List[str] = [
+# Feature per la testa SB e per la testa multiclass,
+RAW_FEATURE_BRANCHES: List[str] = [
     "m 4l", "m recoil 4l", "dphi sys nu",
     "m_min", "m_midlow", "m_midhigh", "m_max",
     "pt_min", "pt_midlow", "pt_midhigh", "pt_max",
@@ -151,37 +59,6 @@ RAW_FEATURE_BRANCHES_4l: List[str] = [
     "pdg_lep1", "pdg_lep2", "pdg_lep3", "pdg_lep4", 
     "neutrinos_pt", "neutrinos_eta", "neutrinos_phi", "neutrinos_m", 
 ]
-RAW_FEATURE_BRANCHES_6l: List[str] = [
-    "m recoil H", "m recoil ee", "m Z1", "m Z2", "m Tag", "m ZZ",
-    "dphi Z1", "dphi Z2", "dphi Tag", "deta Z1", "deta Z2", "deta Tag",
-    "dr Z1", "dr Z2", "dr Tag", "pt Z1", "pt Z2", "pt Tag",
-    "phi Z1_1", "phi Z2_1", "phi Tag_1", "eta Z1_1", "eta Z2_1", "eta Tag_1", "pt Z1_1", "pt Z2_1", "pt Tag_1",
-    "phi Z1_2", "phi Z2_2", "phi Tag_2", "eta Z1_2", "eta Z2_2", "eta Tag_2", "pt Z1_2", "pt Z2_2", "pt Tag_2",
-    "pt_lep1", "eta_lep1", "phi_lep1", "pdg_lep1",
-    "pt_lep2", "eta_lep2", "phi_lep2", "pdg_lep2",
-    "pt_lep3", "eta_lep3", "phi_lep3", "pdg_lep3",
-    "pt_lep4", "eta_lep4", "phi_lep4", "pdg_lep4",
-    "pt_lep5", "eta_lep5", "phi_lep5", "pdg_lep5",
-    "pt_lep6", "eta_lep6", "phi_lep6", "pdg_lep6",
-    "m_rank1", "dphi_rank1", "deta_rank1", "dr_rank1", "pt_rank1", "eta_rank1", "phi_rank1", "is_os_sf_rank1", "mT rank1 nu",
-    "m_rank2", "dphi_rank2", "deta_rank2", "dr_rank2", "pt_rank2", "eta_rank2", "phi_rank2", "is_os_sf_rank2", "mT rank2 nu",
-    "m_rank3", "dphi_rank3", "deta_rank3", "dr_rank3", "pt_rank3", "eta_rank3", "phi_rank3", "is_os_sf_rank3", "mT rank3 nu",
-    "m_rank4", "dphi_rank4", "deta_rank4", "dr_rank4", "pt_rank4", "eta_rank4", "phi_rank4", "is_os_sf_rank4", "mT rank4 nu",
-    "m_rank5", "dphi_rank5", "deta_rank5", "dr_rank5", "pt_rank5", "eta_rank5", "phi_rank5", "is_os_sf_rank5", "mT rank5 nu",
-    "m_rank6", "dphi_rank6", "deta_rank6", "dr_rank6", "pt_rank6", "eta_rank6", "phi_rank6", "is_os_sf_rank6", "mT rank6 nu",
-    "m_rank7", "dphi_rank7", "deta_rank7", "dr_rank7", "pt_rank7", "eta_rank7", "phi_rank7", "is_os_sf_rank7", "mT rank7 nu",
-    "m_rank8", "dphi_rank8", "deta_rank8", "dr_rank8", "pt_rank8", "eta_rank8", "phi_rank8", "is_os_sf_rank8", "mT rank8 nu",
-    "m_rank9", "dphi_rank9", "deta_rank9", "dr_rank9", "pt_rank9", "eta_rank9", "phi_rank9", "is_os_sf_rank9", "mT rank9 nu",
-    "m 6l", "neutrinos_m", "neutrinos_eta", "neutrinos_phi", "neutrinos_pt", "m recoil 6l", "dphi sys nu", 
-]
-RAW_FEATURE_BRANCHES_2l: List[str] = [
-    "m", "dphi", "deta", "dr", "pt", "px", "py", "pz", "px_i", "px_j", "py_i", "py_j", "pz_i", "pz_j",
-    "neutrinos_pt", "neutrinos_phi", "neutrinos_eta", "neutrinos_m", "eta", "phi", 
-    "pt_i", "pt_j", "phi_i", "phi_j", "eta_i", "eta_j", "pdg_i", "pdg_j",
-    "m_6l", "pt_6l", "phi_6l", #"eta_6l", <-- mi sa che l'eta non ha senso...
-    "mt_lep1_met", "mt_lep2_met", "mt_ll_met", "dphi_ll_met", "pt_ll_met", "pt_ratio_ll_met",
-    "pt_asym",  "balance", "is_sf",  "mt2_ll", "cos_theta_star",
-]
 
 @dataclass
 class InputSample:
@@ -193,34 +70,16 @@ class InputSample:
 
 INPUT_SAMPLES: List[InputSample] = [
     InputSample(path="../rootfiles/4chlep2nu.root", total_events=300000),
-    #InputSample(path="../rootfiles/pair2lep.root", total_events=300000),
-    #InputSample(path="../rootfiles/allpairs6lep.root", total_events=300000),
-    #InputSample(path="../rootfiles/4chlep2nu_1M.root", total_events=1000000),
+
 ]
 
-#SB_MODEL_PATH: str = "../ML_classifier/Modelli_migliori/4l/outputs_11_best_sig/sb_only/best_model.keras"       
-#MULTI_MODEL_PATH: str = "../ML_classifier/Modelli_migliori/4l/outputs_11_best_sig/multi_only/best_model.keras"  
-SB_MODEL_PATH_2: str = "../ML_classifier/Modelli_migliori/2l/outputs_3/sb_only/best_model.keras"       
-MULTI_MODEL_PATH_2: str = "../ML_classifier/Modelli_migliori/2l/outputs_3/multi_only/best_model.keras" 
-SB_MODEL_PATH_4: str = "../ML_classifier/Modelli_migliori/4l/outputs_bktrain_1M_1/sb_only/best_model.keras"       
-MULTI_MODEL_PATH_4: str = "../ML_classifier/Modelli_migliori/4l/outputs_bktrain_1M_1/multi_only/best_model.keras"  
-SB_MODEL_PATH_6: str = "../ML_classifier/Modelli_migliori/6l/outputs_allfeatures_4/sb_only/best_model.keras"       
-MULTI_MODEL_PATH_6: str = "../ML_classifier/Modelli_migliori/6l/outputs_allfeatures_4/multi_only/best_model.keras" 
+SB_MODEL_PATH: str = "../ML_classifier/Modelli_migliori/4l/outputs_bktrain_1M_1/sb_only/best_model.keras"       
+MULTI_MODEL_PATH: str = "../ML_classifier/Modelli_migliori/4l/outputs_bktrain_1M_1/multi_only/best_model.keras"  
 
-PREPROCESSOR_PATH_6: str = "../ML_classifier/Modelli_migliori/6l/preprocessor.pkl"
-PREPROCESSOR_PATH_4: str = "../ML_classifier/Modelli_migliori/4l/outputs_bktrain_1M_1/preprocessor.pkl"
-PREPROCESSOR_PATH_2: str = "../ML_classifier/Modelli_migliori/2l/preprocessor.pkl"
-
-
-SIGNAL_NAMES = SIGNAL_NAMES  # default, sovrascritto in load_dataset in base al file ROOT
-SB_MODEL_PATH: str = SB_MODEL_PATH_4  # default, sovrascritto in load_dataset in base al file ROOT
-MULTI_MODEL_PATH: str = MULTI_MODEL_PATH_4  # default, sovrascritto in load_dataset in base al file ROOT
-PREPROCESSOR_PATH: str = PREPROCESSOR_PATH_4  # default, sovrascritto in load_dataset in base al file ROOT
-RAW_FEATURE_BRANCHES: str = RAW_FEATURE_BRANCHES_4l  # default, sovrascritto in load_dataset in base al file ROOT
+PREPROCESSOR_PATH: str = "../ML_classifier/Modelli_migliori/4l/outputs_bktrain_1M_1/preprocessor.pkl"
 
 CASCADE_THRESHOLD: float = 0.3
-SIGNAL_REGION_THRESHOLD: float = 0.85  # soglia per l'analisi di purezza/efficienza per canale
-
+SIGNAL_REGION_THRESHOLD: float = 0.85  
 OUTPUT_DIR: str = "output_classificazione_cascata"
 PREDICTIONS_OUTPUT_PATH: str = os.path.join(OUTPUT_DIR, "predizioni_evento_per_evento.csv")
 
@@ -279,7 +138,6 @@ def wrap_phi(phi: pd.Series | np.ndarray) -> np.ndarray:
     return (phi + np.pi) % (2 * np.pi) - np.pi
 
 def add_trig_phi_features(df: pd.DataFrame, phi_columns: Sequence[str]) -> pd.DataFrame:
-    """Replace/augment phi with sin(phi), cos(phi)."""
     df = df.copy()
     for col in phi_columns:
         phi = wrap_phi(df[col].values)
@@ -288,13 +146,6 @@ def add_trig_phi_features(df: pd.DataFrame, phi_columns: Sequence[str]) -> pd.Da
     return df
 
 def process_pdg_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Elabora le colonne pdg_lep1..pdg_lep4 (PDG id dei singoli leptoni, schema
-    attuale) in: carica (+1/-1, ricavata dal segno del pdgId: per i leptoni
-    pdgId>0 => carica -1) e one-hot di flavor (is_e/is_mu/is_tau). Rimuove il
-    pdgId grezzo, che altrimenti verrebbe passato alla rete come se fosse una
-    quantita' numerica continua invece che una categoria.
-    """
     df = df.copy()
 
     pdg_cols = [c for c in df.columns if c.startswith("pdg")]
@@ -314,10 +165,6 @@ def process_pdg_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def apply_sqrt_to_separations(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Applica la radice quadrata alle separazioni angolari (Delta Eta, Delta R)
-    per smussare le code asimmetriche senza schiacciarle eccessivamente.
-    """
     df = df.copy()
 
     for col in df.columns:
@@ -331,16 +178,6 @@ def apply_sqrt_to_separations(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def scale_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Scala i momenti trasversi (pT) all'energia del fascio (120 GeV), e le
-    masse invarianti/trasverse all'energia nel centro di massa (240 GeV).
-
-    Unica trasformazione applicata a pT/masse (niente log1p aggiuntivo, vedi
-    nota 3 in testa al file): riconosce esplicitamente tutte le varianti di
-    naming attualmente in uso, incluse quelle con spazio ("m 4l",
-    "m recoil 4l", "mT <rango> nu") che il vecchio pattern a sottostringa
-    ("m_", "mass", "mll", ...) non copriva.
-    """
     df = df.copy()
 
     for col in df.columns:
@@ -364,11 +201,6 @@ def scale_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def transform_dphi_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Applica il coseno alla separazione angolare trasversa (Delta Phi).
-    Mappa l'angolo [0, pi] nel range lineare [-1, 1] corrispondente alla
-    proiezione trasversa.
-    """
     df = df.copy()
 
     for col in df.columns:
@@ -385,13 +217,6 @@ def transform_dphi_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def run_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pipeline completa. A differenza della versione precedente, le funzioni
-    vengono chiamate incondizionatamente (ognuna gia' filtra internamente le
-    colonne pertinenti): i "gate" esterni a match esatto sono stati rimossi
-    perche' erano la causa per cui log1p/sqrt/scaling/cos(dphi) non
-    scattavano mai con lo schema di naming attuale.
-    """
     df = df.copy()
 
     phi_cols = [c for c in df.columns if c.startswith("phi")]
@@ -411,32 +236,6 @@ def handle_missing_reconstruction(
     df: pd.DataFrame,
     exclude_columns: Sequence[str] = ("kind_events", "Weight_weight"),
 ) -> pd.DataFrame:
-    """
-    Alcuni eventi non hanno una ricostruzione completa (es. nel dataset a 6
-    leptoni, l'algoritmo di pairing non trova 3 coppie valide - NON solo il
-    Tag, tutte le variabili derivate restano NaN insieme per quell'evento).
-    Fisicamente questo capita SOLO per il fondo, mai per ZZ+H/ZZ: l'assenza
-    stessa di ricostruzione e' quindi un'informazione discriminante, non
-    solo un dato mancante da scartare.
-
-    Comportamento:
-      1) aggiunge una colonna "has_full_reco" (1.0 se la riga NON ha NaN in
-         nessuna colonna numerica esclusa label/peso, 0.0 altrimenti) -
-         PRIMA di riempire qualunque NaN, cosi' la rete puo' imparare
-         direttamente "niente ricostruzione => quasi certamente fondo"
-         invece di doverlo dedurre da valori imputati.
-      2) riempie i NaN residui con la media di colonna (sull'intero
-         DataFrame passato, non train-only: e' un'imputazione
-         intenzionalmente "non informativa", il segnale vero e' nel flag
-         del punto 1 - non nel valore imputato in se').
-
-    Su un DataFrame senza NaN e' un no-op tranne per l'aggiunta della
-    colonna "has_full_reco" (costante a 1.0) - innocua, mantiene lo schema
-    di feature coerente tra dataset diversi.
-
-    exclude_columns va escluso dal controllo/imputazione: mai riempire con
-    la media la label o il peso fisico.
-    """
     df = df.copy()
     numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude_columns]
 
@@ -456,13 +255,6 @@ def handle_missing_reconstruction(
     return df
 
 def run_feature_engineering_6l(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pipeline completa. A differenza della versione precedente, le funzioni
-    vengono chiamate incondizionatamente (ognuna gia' filtra internamente le
-    colonne pertinenti): i "gate" esterni a match esatto sono stati rimossi
-    perche' erano la causa per cui log1p/sqrt/scaling/cos(dphi) non
-    scattavano mai con lo schema di naming attuale.
-    """
     df = df.copy()
 
     df = handle_missing_reconstruction(df)
@@ -533,11 +325,6 @@ def build_true_labels(df: pd.DataFrame) -> np.ndarray:
     return y_true
 
 def extract_features_for_inference(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-    """
-    Replica il criterio del training: tutte le colonne numeriche
-    tranne label e peso vengono usate come feature.
-    L'ordine è quello del DataFrame dopo la feature engineering.
-    """
     feature_columns = [
         c for c in df.columns
         if c not in [LABEL_BRANCH, WEIGHT_BRANCH, "peso_fisico", "file_origine"]
@@ -1093,12 +880,6 @@ def main():
     df = load_dataset(INPUT_SAMPLES)
 
     print("[INFO] Estrazione feature per inferenza...")
-    # IMPORTANTE: questa chiamata deve avvenire PRIMA di aggiungere qualunque
-    # colonna derivata al DataFrame (y_true_6, predizioni, ...).
-    # extract_features_for_inference raccoglie "tutte le colonne numeriche
-    # tranne label/peso": se costruissimo prima y_true_6 (anch'essa numerica),
-    # verrebbe raccolta per errore come se fosse una feature, sfasando le
-    # colonne rispetto a quelle viste dallo StandardScaler in training.
     X_raw, feature_columns = extract_features_for_inference(df)
 
     print("[INFO] Applicazione preprocessor...")
@@ -1132,11 +913,6 @@ def main():
     y_pred_multi_signal = df["y_pred_multi_signal"].to_numpy()
     y_pred_multi_full = cascade_outputs["y_pred_multi_full_idx"]
 
-    # NB: "Fondo Totale" deve essere IDENTICO al BKG_LABEL usato in
-    # template_fit_multicanale.py — quello script fa un reindex sui nomi di
-    # classe, quindi un nome diverso (es. "Bkg") farebbe sparire silenziosamente
-    # la riga/colonna di fondo (tutta a zero dopo il reindex) invece di dare
-    # errore.
     class_names_6 = SIGNAL_NAMES + ["Fondo Totale"]
     y_true_binary = (y_true_6 < len(SIGNAL_NAMES)).astype(int)
     y_pred_binary = (y_prob_sb >= CASCADE_THRESHOLD).astype(int)
@@ -1146,7 +922,6 @@ def main():
     
     true_signal_mask = y_true_6 < len(SIGNAL_NAMES)
     plot_conf_matrix(y_true_6[true_signal_mask], y_pred_multi_signal[true_signal_mask], SIGNAL_NAMES, OUTPUT_DIR, "confusion_matrix_multiclass.png", weights[true_signal_mask], "Multiclass (solo segnali veri)")
-    plot_conf_matrix(y_true_6, y_pred_multi_full, class_names_6, OUTPUT_DIR, "confusion_matrix_multiclass_test.png", weights, "Multiclass (solo segnali veri, Fondo incluso tra le predizioni)")
 
     plot_conf_matrix(y_true_6, y_pred_cascade, class_names_6, OUTPUT_DIR, "confusion_matrix_cascade_6x6.png", weights, f"Cascade threshold = {CASCADE_THRESHOLD}")
 
@@ -1155,9 +930,6 @@ def main():
     analyze_binary_signal_region(y_true_binary, y_prob_sb, weights, threshold=SIGNAL_REGION_THRESHOLD)
 
     print("[INFO] Split 50/50 del dataset con colonne incorporate...")
-    # Stratifico su "y_true_6" (le 6 classi che contano per il fit), non su
-    # kind_events grezzo: sono equivalenti come bilanciamento, ma "y_true_6"
-    # è la colonna che poi viene davvero usata a valle (template/composizione).
     df_half1, df_half2 = split_dataframe_50_50(df, label_branch="y_true_6")
 
     print("[INFO] Generazione template e composizione...")

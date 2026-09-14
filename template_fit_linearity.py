@@ -15,7 +15,7 @@ from template_fit_mle_and_toys import load_channel_matrices, run_toy_mc
 MU_SCAN_VALUES: List[float] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]
 N_TOYS_PER_POINT: int = 2000
 RANDOM_SEED: int = 98765
-TOY_MODE: str = "poisson_effective"  # "poisson_effective" oppure "gaussian"
+TOY_MODE: str = "poisson_effective"  
 
 OUTPUT_DIR: str = "output_template_fit_linearity"
 

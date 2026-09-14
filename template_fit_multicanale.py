@@ -14,12 +14,11 @@ BKG_LABEL = "Fondo Totale"
 # =====================================================================
 @dataclass
 class ChannelConfig:
-    name: str  # id breve, usato anche come nome di sottocartella (es. "4l2v", "6l", "2l4n")
+    name: str  #
     signal_names: List[str]
     template_events_parquet: str
     composition_events_parquet: str
-    label: Optional[str] = None  # etichetta leggibile per stampe/grafici; default = name
-
+    label: Optional[str] = None  
     def display_label(self) -> str:
         return self.label or self.name
 
@@ -36,8 +35,8 @@ CHANNELS: List[ChannelConfig] = [
         name="4l2v",
         label="4l2v",
         signal_names=["WW+H", "ZZ+H", "ZZ", "WZ", "WW"],
-        template_events_parquet="output_classificazione_4_cascata_bkg/meta_template/template_eventi.parquet",
-        composition_events_parquet="output_classificazione_4_cascata_bkg/meta_composizione/composizione_eventi.parquet",
+        template_events_parquet="template_eventi.parquet",
+        composition_events_parquet="composizione_eventi.parquet",
     ),
 ]
 
@@ -90,7 +89,7 @@ def fit_signal_strengths(
 ) -> Dict[str, np.ndarray]:
     bkg_idx = n_signal
 
-    A = counts_template[:n_signal, :].T  # (n_bin, n_segnali)
+    A = counts_template[:n_signal, :].T  
     bkg_pred = counts_template[bkg_idx, :]
     bkg_var = variance_template[bkg_idx, :]
 
